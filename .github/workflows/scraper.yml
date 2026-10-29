@@ -20,7 +20,7 @@ permissions:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout Repository
@@ -31,22 +31,15 @@ jobs:
         with:
           node-version: '20'
 
+      # Puppeteer will download its own matching Chrome during this step.
       - name: Install Dependencies
-        env:
-          PUPPETEER_SKIP_DOWNLOAD: "true"
         run: npm install
-
-      - name: Setup Chrome
-        uses: browser-actions/setup-chrome@v1
-        with:
-          chrome-version: stable
 
       - name: Run Scraper
         id: scraper_task
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
         run: npm start
 
       - name: Evaluate Self-Reboot
