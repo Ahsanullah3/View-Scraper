@@ -7,7 +7,7 @@ const fs = require('fs');
 puppeteer.use(StealthPlugin());
 
 // =========================================================
-// 1. RETRY HELPER
+// 1. HELPERS
 // =========================================================
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -28,9 +28,38 @@ async function saveWithRetry(sheet, retries = 3) {
     }
 }
 
+// Column map (0-based) — A..AG
+const COL = {
+    url: 0,
+    addr: 9,
+    propertyType: 10,
+    desc: 11,
+    county: 12,
+    price: 13,
+    bedrooms: 14,
+    bathrooms: 15,
+    carparks: 16,
+    landSize: 17,
+    agencyName: 18,
+    agencyAddress: 19,
+    agencyPhone: 20,
+    agencyProfile: 21,
+    agent1Name: 22,
+    agent1Phone: 23,
+    agent1Mobile: 24,
+    agent1Email: 25,
+    agent1Profile: 26,
+    agent2Name: 27,
+    agent2Phone: 28,
+    agent2Mobile: 29,
+    agent2Email: 30,
+    agent2Profile: 31,
+    status: 32
+};
+const REQUIRED_COLUMNS = 33;
+
 // =========================================================
-// 2. EXTRACTOR (in-page)
-// Returns a flat object ready for column mapping
+// 2. IN-PAGE EXTRACTOR
 // =========================================================
 function extractViewDataInPage() {
     const nextDataScript = document.querySelector('script#__NEXT_DATA__');
@@ -52,27 +81,17 @@ function extractViewDataInPage() {
     const addr = [street, d.suburbName, d.state, d.postcode].filter(Boolean).join(", ").trim();
 
     const agentList = Array.isArray(d.agents) ? d.agents : [];
-    const a1 = agentList[0] || {};
-    const a2 = agentList[1] || {};
-
     const buildAgent = (a) => ({
-        firstName: (a.firstName || "").trim(),
-        lastName: (a.lastName || "").trim(),
         fullName: `${(a.firstName || "").trim()} ${(a.lastName || "").trim()}`.trim(),
         phone: a.phone || "",
         mobile: a.mobile || "",
         email: a.email || "",
         profileUrl: a.agentProfileLink ? `${BASE}${a.agentProfileLink}` : ""
     });
-
-    const ag1 = buildAgent(a1);
-    const ag2 = buildAgent(a2);
-
-    // Agency phone: prefer explicit agency phone if present, else first agent's phone
-    const agencyPhone = d.agency?.phone || a1.phone || "";
+    const ag1 = buildAgent(agentList[0] || {});
+    const ag2 = buildAgent(agentList[1] || {});
 
     return {
-        // Property
         addr,
         propertyType: d.primaryPropertyType || d.sourcePropertyType || "",
         desc: d.description || "",
@@ -83,22 +102,19 @@ function extractViewDataInPage() {
         carparks: d.carparks ?? "",
         landSize: d.landSize ?? "",
 
-        // Agency
         agencyName: d.agency?.name || "",
         agencyAddress: d.agency?.address || "",
-        agencyPhone: agencyPhone,
+        agencyPhone: d.agency?.phone || agentList[0]?.phone || "",
         agencyProfileUrl: d.agency?.agencyProfileLink
             ? `${BASE}${d.agency.agencyProfileLink}`
             : "",
 
-        // Agent 1
         agent1Name: ag1.fullName,
         agent1Phone: ag1.phone,
         agent1Mobile: ag1.mobile,
         agent1Email: ag1.email,
         agent1Profile: ag1.profileUrl,
 
-        // Agent 2
         agent2Name: ag2.fullName,
         agent2Phone: ag2.phone,
         agent2Mobile: ag2.mobile,
@@ -108,10 +124,39 @@ function extractViewDataInPage() {
 }
 
 // =========================================================
-// 3. CORE SCRAPER
+// 3. SHEET SAFETY HELPERS
+// =========================================================
+async function ensureSheetWidth(sheet, required) {
+    if (sheet.columnCount < required) {
+        console.log(`📏 Expanding columns from ${sheet.columnCount} to ${required}...`);
+        await sheet.resize({ rowCount: sheet.rowCount, columnCount: required });
+        // Force fresh grid data after resize
+        sheet.resetLocalCache(true);
+        await sheet.loadCells();
+    }
+}
+
+function safeGetCell(sheet, row, col) {
+    try {
+        return sheet.getCell(row, col);
+    } catch (e) {
+        if (String(e.message).includes("not been loaded") || String(e.message).includes("Out of bounds")) {
+            throw new Error(`Cell (${row},${col}) not loaded — sheet resize/loadCells mismatch`);
+        }
+        throw e;
+    }
+}
+
+function writeCell(sheet, row, col, value) {
+    const cell = safeGetCell(sheet, row, col);
+    cell.value = value;
+}
+
+// =========================================================
+// 4. CORE SCRAPER
 // =========================================================
 async function runScraper() {
-    console.log("🚀 Starting View.com.au Scraper V2...");
+    console.log("🚀 Starting View.com.au Scraper V3 (bullet-proof)...");
 
     const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
     const serviceAccountAuth = new JWT({
@@ -124,50 +169,13 @@ async function runScraper() {
     await doc.loadInfo();
     const sheet = doc.sheetsByIndex[0];
 
-    // Need columns A..Y (25). A=URL, then outputs, last = status
-    if (sheet.columnCount < 25) {
-        console.log(`📏 Expanding columns from ${sheet.columnCount} to 25...`);
-        await sheet.resize({ rowCount: sheet.rowCount, columnCount: 25 });
-    }
+    // 1. Ensure width BEFORE loading cells
+    await ensureSheetWidth(sheet, REQUIRED_COLUMNS);
 
+    // 2. Load all cells
     await sheet.loadCells();
 
-    // Column map (0-based)
-    const COL = {
-        url: 0,          // A
-        // J..(spare) used below
-        addr: 9,         // J
-        propertyType: 10,// K
-        desc: 11,        // L
-        county: 12,      // M
-        price: 13,       // N
-        bedrooms: 14,    // O
-        bathrooms: 15,   // P
-        carparks: 16,    // Q
-        landSize: 17,    // R
-        agencyName: 18,  // S
-        agencyAddress: 19, // T
-        agencyPhone: 20, // U
-        agencyProfile: 21, // V
-        agent1Name: 22,  // W
-        agent1Phone: 23, // X
-        agent1Mobile: 24,// Y
-        agent1Email: 25, // Z
-        agent1Profile: 26,// AA
-        agent2Name: 27,  // AB
-        agent2Phone: 28, // AC
-        agent2Mobile: 29,// AD
-        agent2Email: 30, // AE
-        agent2Profile: 31,// AF
-        status: 32       // AG
-    };
-
-    // Ensure enough columns for AG (32)
-    if (sheet.columnCount < 33) {
-        console.log(`📏 Expanding columns to 33 (A..AG)...`);
-        await sheet.resize({ rowCount: sheet.rowCount, columnCount: 33 });
-    }
-
+    // 3. Launch browser
     const browser = await puppeteer.launch({
         headless: "new",
         executablePath: process.env.CHROME_PATH || undefined,
@@ -187,12 +195,19 @@ async function runScraper() {
     let stagedCellsToSave = [];
 
     for (let rowIndex = 1; rowIndex < sheet.rowCount; rowIndex++) {
-        const url = sheet.getCell(rowIndex, COL.url).value;
-        const status = sheet.getCell(rowIndex, COL.status).value || "";
+        // Safe read — if status cell fails, treat as empty
+        let url, status;
+        try {
+            url = safeGetCell(sheet, rowIndex, COL.url).value;
+            status = safeGetCell(sheet, rowIndex, COL.status).value || "";
+        } catch (e) {
+            console.error(`⚠️ Skipping row ${rowIndex + 1}: ${e.message}`);
+            continue;
+        }
 
         if (!url) continue;
-        if (!url.includes("view.com.au")) continue;
-        if (status.includes("✅")) continue;
+        if (!String(url).includes("view.com.au")) continue;
+        if (String(status).includes("✅")) continue;
 
         if (scrapeCount >= 30) {
             console.log("🛑 Reached 30 rows. Stopping to rotate environment...");
@@ -237,7 +252,7 @@ async function runScraper() {
 
             if (isBlocked) {
                 console.log(`❌ BLOCKED on Row ${actualRowNumber}`);
-                sheet.getCell(rowIndex, COL.status).value = "❌ BLOCKED (DataDome)";
+                writeCell(sheet, rowIndex, COL.status, "❌ BLOCKED (DataDome)");
                 stagedCellsToSave.push(rowIndex);
                 consecutiveBlocks++;
 
@@ -258,43 +273,41 @@ async function runScraper() {
 
             if (!extractedData) {
                 console.log(`⚠️ No __NEXT_DATA__ payload on Row ${actualRowNumber}`);
-                sheet.getCell(rowIndex, COL.status).value = "⚠️ No Data";
+                writeCell(sheet, rowIndex, COL.status, "⚠️ No Data");
                 stagedCellsToSave.push(rowIndex);
                 await page.close();
                 continue;
             }
 
-            // Write all fields
-            const setCell = (idx, val) => { sheet.getCell(rowIndex, idx).value = val; };
+            // Write all fields safely
+            writeCell(sheet, rowIndex, COL.addr, extractedData.addr);
+            writeCell(sheet, rowIndex, COL.propertyType, extractedData.propertyType);
+            writeCell(sheet, rowIndex, COL.desc, extractedData.desc);
+            writeCell(sheet, rowIndex, COL.county, extractedData.county);
+            writeCell(sheet, rowIndex, COL.price, extractedData.price);
+            writeCell(sheet, rowIndex, COL.bedrooms, extractedData.bedrooms);
+            writeCell(sheet, rowIndex, COL.bathrooms, extractedData.bathrooms);
+            writeCell(sheet, rowIndex, COL.carparks, extractedData.carparks);
+            writeCell(sheet, rowIndex, COL.landSize, extractedData.landSize);
 
-            setCell(COL.addr, extractedData.addr);
-            setCell(COL.propertyType, extractedData.propertyType);
-            setCell(COL.desc, extractedData.desc);
-            setCell(COL.county, extractedData.county);
-            setCell(COL.price, extractedData.price);
-            setCell(COL.bedrooms, extractedData.bedrooms);
-            setCell(COL.bathrooms, extractedData.bathrooms);
-            setCell(COL.carparks, extractedData.carparks);
-            setCell(COL.landSize, extractedData.landSize);
+            writeCell(sheet, rowIndex, COL.agencyName, extractedData.agencyName);
+            writeCell(sheet, rowIndex, COL.agencyAddress, extractedData.agencyAddress);
+            writeCell(sheet, rowIndex, COL.agencyPhone, extractedData.agencyPhone);
+            writeCell(sheet, rowIndex, COL.agencyProfile, extractedData.agencyProfileUrl);
 
-            setCell(COL.agencyName, extractedData.agencyName);
-            setCell(COL.agencyAddress, extractedData.agencyAddress);
-            setCell(COL.agencyPhone, extractedData.agencyPhone);
-            setCell(COL.agencyProfile, extractedData.agencyProfileUrl);
+            writeCell(sheet, rowIndex, COL.agent1Name, extractedData.agent1Name);
+            writeCell(sheet, rowIndex, COL.agent1Phone, extractedData.agent1Phone);
+            writeCell(sheet, rowIndex, COL.agent1Mobile, extractedData.agent1Mobile);
+            writeCell(sheet, rowIndex, COL.agent1Email, extractedData.agent1Email);
+            writeCell(sheet, rowIndex, COL.agent1Profile, extractedData.agent1Profile);
 
-            setCell(COL.agent1Name, extractedData.agent1Name);
-            setCell(COL.agent1Phone, extractedData.agent1Phone);
-            setCell(COL.agent1Mobile, extractedData.agent1Mobile);
-            setCell(COL.agent1Email, extractedData.agent1Email);
-            setCell(COL.agent1Profile, extractedData.agent1Profile);
+            writeCell(sheet, rowIndex, COL.agent2Name, extractedData.agent2Name);
+            writeCell(sheet, rowIndex, COL.agent2Phone, extractedData.agent2Phone);
+            writeCell(sheet, rowIndex, COL.agent2Mobile, extractedData.agent2Mobile);
+            writeCell(sheet, rowIndex, COL.agent2Email, extractedData.agent2Email);
+            writeCell(sheet, rowIndex, COL.agent2Profile, extractedData.agent2Profile);
 
-            setCell(COL.agent2Name, extractedData.agent2Name);
-            setCell(COL.agent2Phone, extractedData.agent2Phone);
-            setCell(COL.agent2Mobile, extractedData.agent2Mobile);
-            setCell(COL.agent2Email, extractedData.agent2Email);
-            setCell(COL.agent2Profile, extractedData.agent2Profile);
-
-            setCell(COL.status, "✅ SUCCESS");
+            writeCell(sheet, rowIndex, COL.status, "✅ SUCCESS");
 
             stagedCellsToSave.push(rowIndex);
             console.log(
@@ -308,8 +321,12 @@ async function runScraper() {
 
         } catch (e) {
             console.error(`🛑 Row ${actualRowNumber} error: ${e.message}`);
-            sheet.getCell(rowIndex, COL.status).value = "🛑 Error: " + e.message.slice(0, 80);
-            stagedCellsToSave.push(rowIndex);
+            try {
+                writeCell(sheet, rowIndex, COL.status, "🛑 Error: " + e.message.slice(0, 80));
+                stagedCellsToSave.push(rowIndex);
+            } catch (inner) {
+                console.error(`  ↳ Could not write error status: ${inner.message}`);
+            }
         } finally {
             await page.close();
         }
