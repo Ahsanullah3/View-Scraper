@@ -1,0 +1,16 @@
+{
+  "name": "view-com-au-scraper",
+  "version": "1.0.0",
+  "description": "Headless View.com.au scraper with Google Sheets output",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "google-auth-library": "latest",
+    "google-spreadsheet": "latest",
+    "puppeteer": "^24.15.0",
+    "puppeteer-extra": "latest",
+    "puppeteer-extra-plugin-stealth": "latest"
+  }
+}
