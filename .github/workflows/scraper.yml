@@ -1,0 +1,61 @@
+name: 🚀 View.com.au Scraper V1
+
+run-name: 🚀 View.com.au Scraper V1 (Batch ${{ inputs.batch || '1' }})
+
+on:
+  schedule:
+    - cron: '0 */4 * * *'
+  workflow_dispatch:
+    inputs:
+      batch:
+        description: "Current batch number"
+        required: false
+        default: "1"
+        type: string
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Dependencies
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: "true"
+        run: npm install
+
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Run Scraper
+        id: scraper_task
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: npm start
+
+      - name: Evaluate Self-Reboot
+        if: steps.scraper_task.outputs.has_more == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CURRENT_BATCH="${{ inputs.batch || '1' }}"
+          NEXT_BATCH=$((CURRENT_BATCH + 1))
+          echo "Batch $CURRENT_BATCH done. Triggering Batch $NEXT_BATCH..."
+          gh workflow run scraper.yml --ref main -f batch=$NEXT_BATCH
+          sleep 5
