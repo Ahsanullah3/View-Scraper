@@ -136,7 +136,7 @@ function writeCell(sheet, row, col, value) {
 // 4. CORE SCRAPER
 // =========================================================
 async function runScraper() {
-    console.log("🚀 Starting View.com.au Scraper V5 (retry + fast skip)...");
+    console.log("🚀 Starting View.com.au Scraper V6 (bullet-proof)...");
 
     const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
     const serviceAccountAuth = new JWT({
@@ -231,9 +231,14 @@ async function runScraper() {
             // ---- Fast __NEXT_DATA__ presence poll (max ~1s) ----
             let hasNextData = false;
             for (let i = 0; i < 10; i++) {
-                hasNextData = await page.evaluate(
-                    () => !!document.querySelector('script#__NEXT_DATA__')
-                );
+                try {
+                    hasNextData = await page.evaluate(
+                        () => !!document.querySelector('script#__NEXT_DATA__')
+                    );
+                } catch (_) {
+                    hasNextData = false;
+                    break;
+                }
                 if (hasNextData) break;
                 await delay(100);
             }
@@ -242,19 +247,21 @@ async function runScraper() {
                 console.log(`⚠️ No __NEXT_DATA__ on Row ${actualRowNumber} — skipping`);
                 writeCell(sheet, rowIndex, COL.status, "⚠️ No Data");
                 stagedCellsToSave.push(rowIndex);
-                await page.close();
-                continue;
+                continue;               // finally handles close
             }
 
             // ---- Combined block detection (1 evaluate) ----
-            const blockCheck = await page.evaluate(() => {
-                const title = document.title || "";
-                const body = (document.body?.innerText || "").slice(0, 2000);
-                const captcha = !!document.querySelector(
-                    'iframe[src*="captcha-delivery"], iframe[src*="datadome"]'
-                );
-                return { title, body, captcha };
-            });
+            let blockCheck = { title: "", body: "", captcha: false };
+            try {
+                blockCheck = await page.evaluate(() => {
+                    const title = document.title || "";
+                    const body = (document.body?.innerText || "").slice(0, 2000);
+                    const captcha = !!document.querySelector(
+                        'iframe[src*="captcha-delivery"], iframe[src*="datadome"]'
+                    );
+                    return { title, body, captcha };
+                });
+            } catch (_) { /* page may have died; treat as not blocked */ }
 
             const isBlocked =
                 blockCheck.title.includes("Pardon Our Interruption") ||
@@ -281,24 +288,24 @@ async function runScraper() {
                     console.log("🛑 3 consecutive blocks — stopping run to protect IP.");
                     await saveWithRetry(sheet);
                     rowsRemaining = true;
-                    await page.close();
-                    break;
+                    break;                  // finally handles close
                 }
-                await page.close();
-                continue;
+                continue;                   // finally handles close
             }
 
             consecutiveBlocks = 0;
 
             // ---- Extract ----
-            const extractedData = await page.evaluate(extractViewDataInPage);
+            let extractedData = null;
+            try {
+                extractedData = await page.evaluate(extractViewDataInPage);
+            } catch (_) { extractedData = null; }
 
             if (!extractedData) {
                 console.log(`⚠️ No payload data on Row ${actualRowNumber} — skipping`);
                 writeCell(sheet, rowIndex, COL.status, "⚠️ No Data");
                 stagedCellsToSave.push(rowIndex);
-                await page.close();
-                continue;
+                continue;                   // finally handles close
             }
 
             // ---- Write all fields ----
@@ -350,7 +357,8 @@ async function runScraper() {
                 console.error(`  ↳ Could not write error status: ${inner.message}`);
             }
         } finally {
-            await page.close();
+            // Safe close — never throws if the page already died
+            try { await page.close(); } catch (_) { /* already closed */ }
         }
 
         if (stagedCellsToSave.length >= FLUSH_BATCH_SIZE) {
