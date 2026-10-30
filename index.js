@@ -30,30 +30,11 @@ async function saveWithRetry(sheet, retries = 3) {
 
 // Column map (0-based) — A..AG
 const COL = {
-    url: 0,
-    addr: 9,
-    propertyType: 10,
-    desc: 11,
-    county: 12,
-    price: 13,
-    bedrooms: 14,
-    bathrooms: 15,
-    carparks: 16,
-    landSize: 17,
-    agencyName: 18,
-    agencyAddress: 19,
-    agencyPhone: 20,
-    agencyProfile: 21,
-    agent1Name: 22,
-    agent1Phone: 23,
-    agent1Mobile: 24,
-    agent1Email: 25,
-    agent1Profile: 26,
-    agent2Name: 27,
-    agent2Phone: 28,
-    agent2Mobile: 29,
-    agent2Email: 30,
-    agent2Profile: 31,
+    url: 0, addr: 9, propertyType: 10, desc: 11, county: 12,
+    price: 13, bedrooms: 14, bathrooms: 15, carparks: 16, landSize: 17,
+    agencyName: 18, agencyAddress: 19, agencyPhone: 20, agencyProfile: 21,
+    agent1Name: 22, agent1Phone: 23, agent1Mobile: 24, agent1Email: 25, agent1Profile: 26,
+    agent2Name: 27, agent2Phone: 28, agent2Mobile: 29, agent2Email: 30, agent2Profile: 31,
     status: 32
 };
 const REQUIRED_COLUMNS = 33;
@@ -130,7 +111,6 @@ async function ensureSheetWidth(sheet, required) {
     if (sheet.columnCount < required) {
         console.log(`📏 Expanding columns from ${sheet.columnCount} to ${required}...`);
         await sheet.resize({ rowCount: sheet.rowCount, columnCount: required });
-        // Force fresh grid data after resize
         sheet.resetLocalCache(true);
         await sheet.loadCells();
     }
@@ -156,7 +136,7 @@ function writeCell(sheet, row, col, value) {
 // 4. CORE SCRAPER
 // =========================================================
 async function runScraper() {
-    console.log("🚀 Starting View.com.au Scraper V3 (bullet-proof)...");
+    console.log("🚀 Starting View.com.au Scraper V5 (retry + fast skip)...");
 
     const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
     const serviceAccountAuth = new JWT({
@@ -169,13 +149,9 @@ async function runScraper() {
     await doc.loadInfo();
     const sheet = doc.sheetsByIndex[0];
 
-    // 1. Ensure width BEFORE loading cells
     await ensureSheetWidth(sheet, REQUIRED_COLUMNS);
-
-    // 2. Load all cells
     await sheet.loadCells();
 
-    // 3. Launch browser
     const browser = await puppeteer.launch({
         headless: "new",
         executablePath: process.env.CHROME_PATH || undefined,
@@ -191,32 +167,49 @@ async function runScraper() {
     let rowsRemaining = false;
     let consecutiveBlocks = 0;
 
-    const FLUSH_BATCH_SIZE = 10;
+    const FLUSH_BATCH_SIZE = 20;
+    const MAX_ROWS_PER_RUN = 60;
+    const MAX_BLOCK_ATTEMPTS = 3;
+
     let stagedCellsToSave = [];
 
     for (let rowIndex = 1; rowIndex < sheet.rowCount; rowIndex++) {
-        // Safe read — if status cell fails, treat as empty
-        let url, status;
+        // ---- Read URL + status safely ----
+        let url, statusVal;
         try {
             url = safeGetCell(sheet, rowIndex, COL.url).value;
-            status = safeGetCell(sheet, rowIndex, COL.status).value || "";
+            statusVal = safeGetCell(sheet, rowIndex, COL.status).value || "";
         } catch (e) {
-            console.error(`⚠️ Skipping row ${rowIndex + 1}: ${e.message}`);
             continue;
         }
 
         if (!url) continue;
-        if (!String(url).includes("view.com.au")) continue;
-        if (String(status).includes("✅")) continue;
+        const urlStr = String(url).trim();
+        if (!urlStr) continue;
+        if (!urlStr.includes("view.com.au")) continue;
 
-        if (scrapeCount >= 30) {
-            console.log("🛑 Reached 30 rows. Stopping to rotate environment...");
+        const statusStr = String(statusVal);
+
+        // Skip already-successful rows
+        if (statusStr.includes("✅")) continue;
+        // Skip rows that gave up after max attempts
+        if (statusStr.includes("gave up")) continue;
+
+        // Parse attempt count from status like "⏳ BLOCKED (retry next batch — attempt 2)"
+        let attemptCount = 0;
+        const attemptMatch = statusStr.match(/attempt\s+(\d+)/i);
+        if (attemptMatch) attemptCount = parseInt(attemptMatch[1], 10);
+        if (attemptCount >= MAX_BLOCK_ATTEMPTS) continue;
+
+        // Row budget — only successful scrapes count
+        if (scrapeCount >= MAX_ROWS_PER_RUN) {
+            console.log(`🛑 Reached ${MAX_ROWS_PER_RUN} rows. Stopping to rotate environment...`);
             rowsRemaining = true;
             break;
         }
 
         const actualRowNumber = rowIndex + 1;
-        console.log(`🕵️ Row ${actualRowNumber}: ${url}`);
+        console.log(`🕵️ Row ${actualRowNumber}: ${urlStr}`);
 
         const page = await browser.newPage();
 
@@ -230,34 +223,62 @@ async function runScraper() {
                 }
             });
 
-            await delay(Math.floor(Math.random() * 3000) + 3000);
+            // Fast human-ish pacing
+            await delay(Math.floor(Math.random() * 1500) + 1500);
 
-            await page.goto(url, { waitUntil: 'networkidle2', timeout: 45000 });
-            await page.waitForSelector('script#__NEXT_DATA__', { timeout: 10000 }).catch(() => {});
+            await page.goto(urlStr, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-            const pageTitle = await page.title();
-            const bodySnippet = await page.evaluate(() => document.body.innerText.slice(0, 2000));
-            const hasCaptcha = await page.evaluate(
-                () => !!document.querySelector('iframe[src*="captcha-delivery"], iframe[src*="datadome"]')
-            );
+            // ---- Fast __NEXT_DATA__ presence poll (max ~1s) ----
+            let hasNextData = false;
+            for (let i = 0; i < 10; i++) {
+                hasNextData = await page.evaluate(
+                    () => !!document.querySelector('script#__NEXT_DATA__')
+                );
+                if (hasNextData) break;
+                await delay(100);
+            }
+
+            if (!hasNextData) {
+                console.log(`⚠️ No __NEXT_DATA__ on Row ${actualRowNumber} — skipping`);
+                writeCell(sheet, rowIndex, COL.status, "⚠️ No Data");
+                stagedCellsToSave.push(rowIndex);
+                await page.close();
+                continue;
+            }
+
+            // ---- Combined block detection (1 evaluate) ----
+            const blockCheck = await page.evaluate(() => {
+                const title = document.title || "";
+                const body = (document.body?.innerText || "").slice(0, 2000);
+                const captcha = !!document.querySelector(
+                    'iframe[src*="captcha-delivery"], iframe[src*="datadome"]'
+                );
+                return { title, body, captcha };
+            });
 
             const isBlocked =
-                pageTitle.includes("Pardon Our Interruption") ||
-                pageTitle.includes("Robot Check") ||
-                pageTitle.includes("Access Denied") ||
-                pageTitle.includes("Blocked") ||
-                bodySnippet.includes("datadome") ||
-                bodySnippet.includes("captcha-delivery") ||
-                hasCaptcha;
+                blockCheck.title.includes("Pardon Our Interruption") ||
+                blockCheck.title.includes("Robot Check") ||
+                blockCheck.title.includes("Access Denied") ||
+                blockCheck.title.includes("Blocked") ||
+                blockCheck.body.includes("datadome") ||
+                blockCheck.body.includes("captcha-delivery") ||
+                blockCheck.captcha;
 
             if (isBlocked) {
-                console.log(`❌ BLOCKED on Row ${actualRowNumber}`);
-                writeCell(sheet, rowIndex, COL.status, "❌ BLOCKED (DataDome)");
+                attemptCount++;
+                const statusText = attemptCount >= MAX_BLOCK_ATTEMPTS
+                    ? `❌ BLOCKED (gave up after ${MAX_BLOCK_ATTEMPTS} attempts)`
+                    : `⏳ BLOCKED (retry next batch — attempt ${attemptCount})`;
+
+                console.log(`❌ BLOCKED on Row ${actualRowNumber} — ${statusText}`);
+                writeCell(sheet, rowIndex, COL.status, statusText);
                 stagedCellsToSave.push(rowIndex);
                 consecutiveBlocks++;
 
+                // Blocked rows do NOT consume the budget
                 if (consecutiveBlocks >= 3) {
-                    console.log("🛑 3 consecutive blocks — stopping run.");
+                    console.log("🛑 3 consecutive blocks — stopping run to protect IP.");
                     await saveWithRetry(sheet);
                     rowsRemaining = true;
                     await page.close();
@@ -269,17 +290,18 @@ async function runScraper() {
 
             consecutiveBlocks = 0;
 
+            // ---- Extract ----
             const extractedData = await page.evaluate(extractViewDataInPage);
 
             if (!extractedData) {
-                console.log(`⚠️ No __NEXT_DATA__ payload on Row ${actualRowNumber}`);
+                console.log(`⚠️ No payload data on Row ${actualRowNumber} — skipping`);
                 writeCell(sheet, rowIndex, COL.status, "⚠️ No Data");
                 stagedCellsToSave.push(rowIndex);
                 await page.close();
                 continue;
             }
 
-            // Write all fields safely
+            // ---- Write all fields ----
             writeCell(sheet, rowIndex, COL.addr, extractedData.addr);
             writeCell(sheet, rowIndex, COL.propertyType, extractedData.propertyType);
             writeCell(sheet, rowIndex, COL.desc, extractedData.desc);
